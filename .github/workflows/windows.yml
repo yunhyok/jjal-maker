@@ -1,0 +1,110 @@
+name: Windows
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions: {}
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Set up dependencies and test
+        run: |
+          python -m venv .venv
+          $python = '.\.venv\Scripts\python.exe'
+          & $python -m pip install -e '.[dev]'
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $python scripts/fetch_dependencies.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $python -m pytest -q
+      - name: Build installer and gather sources
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          & .\.venv\Scripts\python.exe scripts/fetch_dependencies.py --inno
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $compilerHome = Join-Path $env:RUNNER_TEMP 'Inno Setup 6'
+          $inno = Start-Process -FilePath 'vendor/downloads/innosetup-6.7.3.exe' -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER', "/DIR=`"$compilerHome`"" -WindowStyle Hidden -Wait -PassThru
+          if ($inno.ExitCode) { exit $inno.ExitCode }
+          .\scripts\build.ps1 -Iscc (Join-Path $compilerHome 'ISCC.exe')
+      - name: Check install, repair, export and uninstall
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          $installer = (Get-Item ('dist/release/JjalMaker-' + $env:GITHUB_REF_NAME.Substring(1) + '-win-x64-setup.exe')).FullName
+          $dir = Join-Path $env:RUNNER_TEMP 'Jjal Maker smoke'
+          $reportDir = Join-Path $env:RUNNER_TEMP 'Jjal Maker results'
+          $setupArgs = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/LANG=korean', "/DIR=`"$dir`"")
+          foreach ($pass in 1..2) {
+            $setup = Start-Process $installer -ArgumentList $setupArgs -WindowStyle Hidden -Wait -PassThru
+            if ($setup.ExitCode) { throw "Setup attempt $pass exited with $($setup.ExitCode)." }
+          }
+          $oldPath = $env:PATH
+          try {
+            $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+            $app = Start-Process (Join-Path $dir 'JjalMaker.exe') -ArgumentList @('--self-test', "`"$reportDir`"") -WindowStyle Hidden -Wait -PassThru
+          } finally {
+            $env:PATH = $oldPath
+          }
+          $report = Get-Content -LiteralPath (Join-Path $reportDir 'self-test.json') -Raw
+          Write-Host $report
+          $result = $report | ConvertFrom-Json
+          if ($app.ExitCode -or -not $result.success -or $result.ffmpeg -ne (Join-Path $dir '_internal\bin\ffmpeg.exe')) {
+            throw 'Installed app self-test failed or resolved a different FFmpeg.'
+          }
+          $uninstall = Start-Process (Join-Path $dir 'unins000.exe') -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -WindowStyle Hidden -Wait -PassThru
+          if ($uninstall.ExitCode -or (Test-Path -LiteralPath (Join-Path $dir 'JjalMaker.exe')) -or -not (Test-Path -LiteralPath (Join-Path $reportDir 'self-test.json'))) {
+            throw 'Uninstall failed or deleted the external test output.'
+          }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: windows-release
+          path: |
+            dist/release/JjalMaker-*-win-x64-setup.exe
+            dist/release/*.tar.xz
+            dist/release/SHA256SUMS
+          compression-level: 0
+          if-no-files-found: error
+
+  draft:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: windows
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-release
+          path: release
+      - name: Upload draft assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $assets = (Get-ChildItem -LiteralPath 'release' -File).FullName
+          $release = gh release view $env:GITHUB_REF_NAME --json isDraft 2>$null
+          if ($LASTEXITCODE) {
+            gh release create $env:GITHUB_REF_NAME @assets --verify-tag --draft --title "Jjal Maker $env:GITHUB_REF_NAME" --notes 'Windows 11 x64 installer, SHA-256 checksums, and corresponding FFmpeg and Qt source archives.'
+          } elseif (($release | ConvertFrom-Json).isDraft) {
+            gh release upload $env:GITHUB_REF_NAME @assets --clobber
+          } else {
+            Write-Host 'The release has already been published.'
+          }
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
